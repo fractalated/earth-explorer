@@ -474,7 +474,8 @@ const PLATE_LINES = [[-0.44,-54.85,-0.04,-54.68,0.44,-54.45,0.96,-54.83,1.69,-54
       const m = Math.round(h);
       const ft = Math.round(h * 3.28084);
       info.querySelector('.elev').textContent =
-        m.toLocaleString() + ' m (' + ft.toLocaleString() + ' ft)' + (m < 0 ? ' below sea level' : '');
+        Math.abs(m).toLocaleString() + ' m (' + Math.abs(ft).toLocaleString() + ' ft)' +
+        (m < 0 ? ' below sea level' : ' above sea level');
     }
   }
 
