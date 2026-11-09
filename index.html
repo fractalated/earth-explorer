@@ -61,6 +61,17 @@
     font-size: 14px; max-width: 80vw; text-align: center; }
   #status[hidden] { display: none; }
 
+  #viewctl { position: absolute; top: 12px; right: 12px; width: 260px; z-index: 2; padding: 12px 14px;
+    background: var(--panel); border: 1px solid var(--panel-edge); border-radius: 12px;
+    backdrop-filter: blur(6px); box-shadow: 0 8px 30px rgba(0,0,0,.45); font-size: 13px; }
+  #viewctl .vc-title { font-size: 11px; font-weight: 700; letter-spacing: 1.2px; text-transform: uppercase;
+    color: var(--muted); margin-bottom: 8px; }
+  #viewctl .vc-row { display: grid; grid-template-columns: 52px 1fr 44px; align-items: center; gap: 8px; margin-bottom: 8px; }
+  #viewctl .vc-val { text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
+  #viewctl input[type=range] { width: 100%; accent-color: var(--accent); margin: 0; }
+  #viewctl .vc-btns { display: flex; gap: 6px; }
+  #viewctl .vc-btns button { flex: 1; padding: 6px 8px; }
+
   /* keep Cesium's credits readable but out of the way */
   .cesium-viewer-bottom { left: 314px !important; }
   .cesium-widget-credits { font-size: 10px; }
@@ -70,6 +81,7 @@
     #panel.collapsed #list, #panel.collapsed .row, #panel.collapsed footer { display: none; }
     #toggle-panel { display: inline-block; float: right; margin-top: -2px; }
     .cesium-viewer-bottom { left: 8px !important; bottom: calc(48vh + 12px) !important; }
+    #viewctl { top: 8px; right: 8px; left: 8px; width: auto; }
   }
 </style>
 </head>
@@ -94,6 +106,16 @@
   <div id="info"><div class="hint">Click a place in the list, or a pin on the globe, to fly there.</div></div>
   <footer>Imagery &amp; elevation: Esri, Maxar, Earthstar Geographics. Plate boundaries: Bird (2003), PB2002 model. Globe: CesiumJS.</footer>
 </aside>
+
+<div id="viewctl" aria-label="Viewing angle">
+  <div class="vc-title">Viewing angle</div>
+  <label class="vc-row"><span>Tilt</span><input id="tilt" type="range" min="0" max="75" step="1" value="0"><span class="vc-val" id="tilt-val">0°</span></label>
+  <label class="vc-row"><span>Rotate</span><input id="heading" type="range" min="-180" max="180" step="1" value="0"><span class="vc-val" id="heading-val">N</span></label>
+  <div class="vc-btns">
+    <button id="north-up" title="Turn the view so north is at the top">⬆ North up</button>
+    <button id="reset-view" title="North up and the standard viewing angle">↺ Reset view</button>
+  </div>
+</div>
 
 <div id="status">Loading the globe…</div>
 
@@ -318,7 +340,7 @@ const PLATE_LINES = [[-0.44,-54.85,-0.04,-54.68,0.44,-54.45,0.96,-54.83,1.69,-54
     terrainProvider,
     baseLayerPicker: false, geocoder: false, homeButton: false, sceneModePicker: false,
     navigationHelpButton: false, animation: false, timeline: false, fullscreenButton: false,
-    infoBox: false, selectionIndicator: true
+    infoBox: false, selectionIndicator: false
   });
   viewer.imageryLayers.addImageryProvider(await Cesium.ArcGisMapServerImageryProvider.fromUrl(LABELS));
   viewer.scene.globe.depthTestAgainstTerrain = true;
@@ -347,7 +369,21 @@ const PLATE_LINES = [[-0.44,-54.85,-0.04,-54.68,0.44,-54.45,0.96,-54.83,1.69,-54
   const pinColor = Cesium.Color.fromCssColorString('#f5c542');
   let tourSource = null;
   let pins = [];
-  const heightCache = new Map();
+  const heightCache = new Map();   // entity -> Promise<ground elevation in m>
+  const groundHeight = new Map();  // entity -> ground elevation once known
+  const groundOf = new Map();      // entity -> Cartographic where the pin meets the ground
+
+  // Flag poles grow with viewing distance so the flag always clears nearby hills,
+  // whether you are looking at the whole Earth or standing next to a volcano.
+  function poleLength(basePos) {
+    const d = Cesium.Cartesian3.distance(viewer.camera.positionWC, basePos);
+    return Cesium.Math.clamp(d * 0.07, 15, 300000);
+  }
+  function makePositionCallback(fn) {
+    return Cesium.CallbackPositionProperty
+      ? new Cesium.CallbackPositionProperty(fn, false)
+      : new Cesium.CallbackProperty(fn, false);
+  }
 
   async function loadTour(data) {
     show('Loading places…');
@@ -361,11 +397,27 @@ const PLATE_LINES = [[-0.44,-54.85,-0.04,-54.68,0.44,-54.45,0.96,-54.83,1.69,-54
 
       pins = ds.entities.values.filter(e => e.position && (e.billboard || e.point));
       pins.forEach((e, i) => {
+        // Remember where the pin touches the ground, then stand a flag pole straight up from there.
+        const ground = Cesium.Cartographic.fromCartesian(e.position.getValue(Cesium.JulianDate.now()));
+        ground.height = 0;
+        groundOf.set(e, ground);
+        const base = () => Cesium.Cartesian3.fromRadians(ground.longitude, ground.latitude, groundHeight.get(e) || 0);
+        const top = () => {
+          const b = base();
+          return Cesium.Cartesian3.fromRadians(ground.longitude, ground.latitude,
+            (groundHeight.get(e) || 0) + poleLength(b));
+        };
+        e.position = makePositionCallback(top);
+        e.polyline = new Cesium.PolylineGraphics({
+          positions: new Cesium.CallbackProperty(() => [base(), top()], false),
+          width: 3, arcType: Cesium.ArcType.NONE,
+          material: new Cesium.PolylineOutlineMaterialProperty({
+            color: Cesium.Color.WHITE, outlineColor: Cesium.Color.BLACK.withAlpha(0.7), outlineWidth: 1
+          })
+        });
         e.billboard = new Cesium.BillboardGraphics({
           image: pinBuilder.fromText(String(i + 1), pinColor, 44).toDataURL(),
-          verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
-          heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
-          disableDepthTestDistance: 60000
+          verticalOrigin: Cesium.VerticalOrigin.BOTTOM
         });
         e.point = undefined;
         e.label = new Cesium.LabelGraphics({
@@ -374,8 +426,6 @@ const PLATE_LINES = [[-0.44,-54.85,-0.04,-54.68,0.44,-54.45,0.96,-54.83,1.69,-54
           fillColor: Cesium.Color.WHITE, outlineColor: Cesium.Color.BLACK, outlineWidth: 3,
           style: Cesium.LabelStyle.FILL_AND_OUTLINE,
           verticalOrigin: Cesium.VerticalOrigin.BOTTOM, pixelOffset: new Cesium.Cartesian2(0, -48),
-          heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
-          disableDepthTestDistance: 60000,
           translucencyByDistance: new Cesium.NearFarScalar(4.0e6, 1.0, 1.6e7, 0.0)
         });
       });
@@ -410,7 +460,8 @@ const PLATE_LINES = [[-0.44,-54.85,-0.04,-54.68,0.44,-54.45,0.96,-54.83,1.69,-54
   }
 
   function cartoOf(e) {
-    return Cesium.Cartographic.fromCartesian(e.position.getValue(viewer.clock.currentTime));
+    const g = groundOf.get(e);
+    return g ? g.clone() : Cesium.Cartographic.fromCartesian(e.position.getValue(viewer.clock.currentTime));
   }
 
   async function terrainHeight(e) {
@@ -419,7 +470,9 @@ const PLATE_LINES = [[-0.44,-54.85,-0.04,-54.68,0.44,-54.45,0.96,-54.83,1.69,-54
       if (!hasTerrain) return null;
       try {
         const [s] = await Cesium.sampleTerrainMostDetailed(terrainProvider, [cartoOf(e)]);
-        return Number.isFinite(s.height) ? s.height : null;
+        if (!Number.isFinite(s.height)) return null;
+        groundHeight.set(e, s.height);
+        return s.height;
       } catch { return null; }
     })();
     heightCache.set(e, p);
@@ -440,10 +493,89 @@ const PLATE_LINES = [[-0.44,-54.85,-0.04,-54.68,0.44,-54.45,0.96,-54.83,1.69,-54
     const h = await Promise.race([terrainHeight(e), new Promise(r => setTimeout(() => r(0), 1500))]);
     const center = Cesium.Cartesian3.fromRadians(c.longitude, c.latitude, h || 0);
     viewer.camera.flyToBoundingSphere(new Cesium.BoundingSphere(center, 1), {
-      offset: new Cesium.HeadingPitchRange(heading, Cesium.Math.toRadians(-40), range),
+      offset: new Cesium.HeadingPitchRange(heading, Cesium.Math.toRadians(DEFAULT_TILT - 90), range),
       duration: 3
     });
   }
+
+  // ---------- Viewing angle (tilt / rotate / reset) ----------
+  // Tilt is measured from straight down: 0° = looking straight down, 75° = looking toward the horizon.
+  const DEFAULT_TILT = 50;        // the angle used when flying to a place
+  const FAR_AWAY = 2500000;       // farther than this (m), "reset" means straight down at the whole globe
+  const tiltEl = document.getElementById('tilt'), headEl = document.getElementById('heading');
+  const tiltVal = document.getElementById('tilt-val'), headVal = document.getElementById('heading-val');
+  let pivot = null, pivotTimer = null, dragging = false;
+
+  // The spot on the ground at the middle of the screen; the view turns and tilts around it.
+  function screenCenterOnGround() {
+    const s = viewer.scene, cv = s.canvas;
+    const mid = new Cesium.Cartesian2(cv.clientWidth / 2, cv.clientHeight / 2);
+    return s.globe.pick(s.camera.getPickRay(mid), s) || s.camera.pickEllipsoid(mid);
+  }
+  function getPivot() {
+    if (!pivot) pivot = screenCenterOnGround();
+    clearTimeout(pivotTimer);
+    pivotTimer = setTimeout(() => { pivot = null; }, 600);
+    return pivot;
+  }
+  function setView(headingDeg, tiltDeg, animate) {
+    const target = animate ? screenCenterOnGround() : getPivot();
+    if (!target) return;
+    const range = Cesium.Cartesian3.distance(viewer.camera.positionWC, target);
+    const offset = new Cesium.HeadingPitchRange(Cesium.Math.toRadians(headingDeg), Cesium.Math.toRadians(tiltDeg - 90), range);
+    if (animate) {
+      viewer.camera.flyToBoundingSphere(new Cesium.BoundingSphere(target, 0), { offset, duration: 0.9 });
+    } else {
+      viewer.camera.lookAt(target, offset);
+      viewer.camera.lookAtTransform(Cesium.Matrix4.IDENTITY);
+    }
+  }
+  const DIRS = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+  function showHeading(deg) {
+    const d = ((Math.round(deg) % 360) + 360) % 360;
+    headVal.textContent = DIRS[Math.round(d / 45) % 8];
+    headVal.title = d + '° from north';
+  }
+  function syncControls() {
+    if (dragging) return;
+    const cam = viewer.camera;
+    // Tilt = angle between "straight up" at the spot you're looking at and the line to the camera.
+    const target = screenCenterOnGround();
+    let tilt;
+    if (target) {
+      const up = Cesium.Ellipsoid.WGS84.geodeticSurfaceNormal(target, new Cesium.Cartesian3());
+      const toCam = Cesium.Cartesian3.normalize(
+        Cesium.Cartesian3.subtract(cam.positionWC, target, new Cesium.Cartesian3()), new Cesium.Cartesian3());
+      tilt = Math.round(Cesium.Math.toDegrees(Math.acos(Cesium.Math.clamp(Cesium.Cartesian3.dot(up, toCam), -1, 1))));
+    } else {
+      tilt = Math.round(90 + Cesium.Math.toDegrees(cam.pitch));
+    }
+    tilt = Cesium.Math.clamp(tilt, 0, 90);
+    let head = Cesium.Math.toDegrees(cam.heading);
+    if (head > 180) head -= 360;
+    tiltEl.value = Math.min(tilt, 75); tiltVal.textContent = tilt + '°';
+    headEl.value = Math.round(head); showHeading(head);
+  }
+  viewer.camera.percentageChanged = 0.001;
+  viewer.camera.changed.addEventListener(syncControls);
+  viewer.camera.moveEnd.addEventListener(syncControls);
+
+  for (const el of [tiltEl, headEl]) {
+    el.addEventListener('pointerdown', () => { dragging = true; });
+    el.addEventListener('pointerup', () => { dragging = false; });
+    el.addEventListener('change', () => { dragging = false; syncControls(); });
+    el.addEventListener('input', () => {
+      tiltVal.textContent = tiltEl.value + '°';
+      showHeading(+headEl.value);
+      setView(+headEl.value, +tiltEl.value, false);
+    });
+  }
+  document.getElementById('north-up').addEventListener('click', () => setView(0, +tiltEl.value, true));
+  document.getElementById('reset-view').addEventListener('click', () => {
+    const target = screenCenterOnGround();
+    const far = !target || Cesium.Cartesian3.distance(viewer.camera.positionWC, target) > FAR_AWAY;
+    setView(0, far ? 0 : DEFAULT_TILT, true);
+  });
 
   function fmt(deg, pos, neg) { return Math.abs(deg).toFixed(3) + '° ' + (deg >= 0 ? pos : neg); }
 
