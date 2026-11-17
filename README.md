@@ -7,11 +7,11 @@ A 3D globe for Earth Science class that runs in Chrome on school Chromebooks, no
 ## What it does
 
 - Spinning 3D globe with satellite imagery, land elevation **and** ocean-floor depth (trenches and ridges show in 3D)
-- Opens with the **Plate Tectonics Tour**: 9 numbered flags on poles that stand straight up from the surface, so hills never hide them. Click one in the list or on the globe to fly there
+- Opens with an empty globe; no tour is built in
 - Shows each place's location and approximate elevation
 - **Plate boundaries** layer (can be turned on or off)
 - **Viewing angle** box: Tilt and Rotate sliders, **North up**, and **Reset view** (north up at the standard 50° angle, or straight down when viewing the whole Earth)
-- **Open KMZ…** button: load any `.kmz` or `.kml` saved from Google Earth to explore a different set of pins
+- **Open KMZ…** button: load any `.kmz` or `.kml` saved from Google Earth. Its places show as numbered flags on poles that stand straight up from the surface, so hills never hide them. Click one in the list or on the globe to fly there
 
 ## Controls
 
@@ -19,10 +19,9 @@ A 3D globe for Earth Science class that runs in Chrome on school Chromebooks, no
 - Scroll or pinch: zoom
 - Ctrl + drag: tilt the view (or use the Tilt slider)
 
-## Changing the built-in tour
+## Sample tour
 
-The default pins are the KML text inside the `<script id="tour-kml">` block in `index.html`.
-The original file is in [`tours/`](tours/).
+[`tours/Plate Tectonics Tour.kmz`](tours/) is a sample file you can download and open with **Open KMZ…**.
 
 ## Web filter checklist
 
