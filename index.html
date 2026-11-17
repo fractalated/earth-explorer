@@ -316,32 +316,35 @@
   //   1. fly looking straight down until you are right above the place, so you can see where you're going;
   //   2. only then tilt (orbiting around the place) to the angle saved in the KMZ.
   // With no saved angle (or a saved tilt of 0) the view stays straight down.
-  let flightId = 0, tiltAnim = null;
+  let flightId = 0, anim = null;
   function cancelFlight() {
     flightId++;
-    viewer.camera.cancelFlight();
-    if (tiltAnim) { viewer.scene.preRender.removeEventListener(tiltAnim); tiltAnim = null; }
+    viewer.camera.cancelFlight();   // in case a Reset view / North up animation is running
+    if (anim) { viewer.scene.preRender.removeEventListener(anim); anim = null; }
   }
   // Grabbing the globe stops any flight in progress.
   for (const ev of ['pointerdown', 'wheel', 'touchstart']) {
     viewer.scene.canvas.addEventListener(ev, cancelFlight, { passive: true });
   }
 
-  // Smoothly swing the camera around a spot on the ground from one tilt to another (radians from straight down).
-  function animateTilt(center, heading, range, from, to, ms) {
+  // Smoothly swing the camera around a spot on the ground from one tilt to another (radians from straight down),
+  // optionally turning from one compass heading to another at the same time.
+  function animateTilt(center, heading, range, from, to, ms, toHeading = heading) {
     return new Promise((resolve) => {
       const start = performance.now();
-      tiltAnim = () => {
+      anim = () => {
         const t = Math.min((performance.now() - start) / ms, 1);
         const k = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;   // ease in-out
-        viewer.camera.lookAt(center, new Cesium.HeadingPitchRange(heading, from + k * (to - from) - Cesium.Math.PI_OVER_TWO, range));
+        // Cesium's lookAt forgets the compass heading at exactly straight down, so stop a hair (0.1°) short.
+        const pitch = Math.max(from + k * (to - from) - Cesium.Math.PI_OVER_TWO, -Cesium.Math.PI_OVER_TWO + 0.002);
+        viewer.camera.lookAt(center, new Cesium.HeadingPitchRange(heading + k * (toHeading - heading), pitch, range));
         viewer.camera.lookAtTransform(Cesium.Matrix4.IDENTITY);
         if (t >= 1) {
-          viewer.scene.preRender.removeEventListener(tiltAnim); tiltAnim = null;
+          viewer.scene.preRender.removeEventListener(anim); anim = null;
           resolve();
         }
       };
-      viewer.scene.preRender.addEventListener(tiltAnim);
+      viewer.scene.preRender.addEventListener(anim);
     });
   }
 
@@ -353,16 +356,21 @@
     return Math.acos(Cesium.Math.clamp(Cesium.Cartesian3.dot(up, toCam), -1, 1));
   }
 
-  // Step 0 (leaving a place): if the view is tilted, swing back to straight down first,
-  // so the whole trip is seen from above.
-  function levelOut() {
+  // Step 0 (leaving a place): swing back to straight down and turn to the trip's final compass heading,
+  // so the whole trip is seen from above. (Turning here matters: Cesium snaps the heading in one
+  // frame when a flight starts from looking straight down, which looks like a sudden jump.)
+  function levelOut(toHeading) {
     const target = screenCenterOnGround();
     if (!target) return Promise.resolve();
     const tilt = currentTilt(target);
-    if (tilt < Cesium.Math.toRadians(1)) return Promise.resolve();
+    const from = viewer.camera.heading;
+    const turn = Cesium.Math.negativePiToPi(toHeading - from);   // shortest way around
+    const tiltDeg = Cesium.Math.toDegrees(tilt), turnDeg = Math.abs(Cesium.Math.toDegrees(turn));
+    if (tiltDeg < 1 && turnDeg < 1) return Promise.resolve();
     const range = Cesium.Cartesian3.distance(viewer.camera.positionWC, target);
-    const ms = 450 + Cesium.Math.toDegrees(tilt) * 22;   // about 1.8 s from a 60° tilt
-    return animateTilt(target, viewer.camera.heading, range, tilt, 0, ms);
+    // about 1.8 s from a 60° tilt; about 1.5 s to turn a quarter of the way around
+    const ms = Math.max(tiltDeg >= 1 ? 450 + tiltDeg * 22 : 0, turnDeg >= 1 ? 600 + turnDeg * 10 : 0);
+    return animateTilt(target, from, range, tilt, 0, ms, from + turn);
   }
 
   // `height` may be a number or a promise of one (the ground height is looked up while leveling out).
@@ -372,19 +380,61 @@
     const range = opts.range || 57500;
     const heading = opts.heading || 0;
     const tilt = Cesium.Math.clamp(opts.tilt || 0, 0, 80);   // radians from straight down
-    const [h] = await Promise.all([Promise.resolve(height), levelOut()]);
+    const [h] = await Promise.all([Promise.resolve(height), levelOut(heading)]);
     if (id !== flightId) return;
     const center = Cesium.Cartesian3.fromRadians(lon, lat, h || 0);
     // Step 1: straight down, directly above the place, at the final viewing distance.
-    viewer.camera.flyTo({
-      destination: Cesium.Cartesian3.fromRadians(lon, lat, (h || 0) + range),
-      orientation: { heading, pitch: -Cesium.Math.PI_OVER_TWO, roll: 0 },
-      duration: opts.duration ?? 6,
-      complete: async () => {
-        if (id !== flightId || tilt < Cesium.Math.toRadians(1)) return;
-        // Step 2: tilt down toward the horizon while circling around the place.
-        await animateTilt(center, heading, range, 0, tilt, 2400);
-      }
+    await travel(Cesium.Cartographic.fromRadians(lon, lat, (h || 0) + range), heading, (opts.duration ?? 6) * 1000);
+    if (id !== flightId || tilt < Cesium.Math.toRadians(1)) return;
+    // Step 2: tilt down toward the horizon while circling around the place.
+    await animateTilt(center, heading, range, 0, tilt, 2400);
+  }
+
+  // Our own straight-down flight (Cesium's built-in one snaps the compass heading and can jump in
+  // altitude when it starts from looking straight down). It follows the shortest path over the globe,
+  // climbs high enough on long trips to see where it's going, and moves the ground under the camera
+  // at a steady on-screen speed: slow when low, fast when high.
+  function travel(end, heading, ms) {
+    return new Promise((resolve) => {
+      const cam = viewer.camera;
+      const start = cam.positionCartographic.clone();
+      const startHeading = cam.heading, startPitch = cam.pitch;
+      const turn = Cesium.Math.negativePiToPi(heading - startHeading);
+      const geo = new Cesium.EllipsoidGeodesic(
+        Cesium.Cartographic.fromRadians(start.longitude, start.latitude),
+        Cesium.Cartographic.fromRadians(end.longitude, end.latitude));
+      const dist = geo.surfaceDistance || 0;
+      const h0 = Math.max(start.height, 1), h1 = Math.max(end.height, 1);
+      const peak = Cesium.Math.clamp(dist * 0.4, 0, 15000000);
+      const l0 = Math.log(h0), l1 = Math.log(h1);
+      const bump = Math.max(0, Math.log(Math.max(peak, 1)) - (l0 + l1) / 2);
+      const smooth = (x) => x * x * (3 - 2 * x);
+      const heightAt = (f) => Math.exp(l0 + (l1 - l0) * smooth(f) + bump * Math.sin(Math.PI * f));
+      // Ground progress proportional to accumulated height, so the view drifts at an even pace on screen.
+      const N = 200, cum = [0];
+      for (let i = 1; i <= N; i++) cum.push(cum[i - 1] + heightAt((i - 0.5) / N));
+      const groundAt = (f) => {
+        const x = f * N, i = Math.min(Math.floor(x), N - 1);
+        return (cum[i] + (cum[i + 1] - cum[i]) * (x - i)) / cum[N];
+      };
+      const t0 = performance.now();
+      const scratch = new Cesium.Cartographic();
+      anim = () => {
+        const t = Math.min((performance.now() - t0) / ms, 1);
+        const f = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;   // ease in-out
+        const g = dist > 1 ? geo.interpolateUsingFraction(groundAt(f), scratch) : end;
+        // Normally the view is already straight down and facing the right way; if not, ease into it early.
+        const w = smooth(Math.min(f / 0.2, 1));
+        cam.setView({
+          destination: Cesium.Cartesian3.fromRadians(g.longitude, g.latitude, f >= 1 ? end.height : heightAt(f)),
+          orientation: { heading: startHeading + turn * w, pitch: startPitch + (-Cesium.Math.PI_OVER_TWO - startPitch) * w, roll: 0 }
+        });
+        if (t >= 1) {
+          viewer.scene.preRender.removeEventListener(anim); anim = null;
+          resolve();
+        }
+      };
+      viewer.scene.preRender.addEventListener(anim);
     });
   }
 
