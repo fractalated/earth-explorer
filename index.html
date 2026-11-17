@@ -34,6 +34,20 @@
     border: 1px solid var(--panel-edge); border-radius: 8px; padding: 7px 10px; cursor: pointer; }
   button:hover, .filebtn:hover { background: rgba(255,255,255,.14); }
 
+  #search { position: relative; padding: 10px 12px; border-bottom: 1px solid var(--panel-edge); }
+  #search form { display: flex; gap: 6px; }
+  #search input { flex: 1; min-width: 0; font: inherit; font-size: 13px; color: var(--text);
+    background: rgba(0,0,0,.35); border: 1px solid var(--panel-edge); border-radius: 8px; padding: 7px 10px; }
+  #search input:focus { outline: none; border-color: rgba(245,197,66,.6); }
+  #search input::-webkit-search-cancel-button { filter: invert(1); }
+  #suggest { position: absolute; left: 12px; right: 12px; top: calc(100% - 6px); z-index: 5; list-style: none;
+    margin: 0; padding: 4px; background: #1b2029; border: 1px solid var(--panel-edge); border-radius: 8px;
+    box-shadow: 0 8px 24px rgba(0,0,0,.5); max-height: 260px; overflow-y: auto; }
+  #suggest[hidden] { display: none; }
+  #suggest li { padding: 7px 8px; border-radius: 6px; font-size: 13px; cursor: pointer; line-height: 1.3; }
+  #suggest li:hover, #suggest li.on { background: var(--hover); }
+  #suggest li.msg { color: var(--muted); cursor: default; background: none; }
+
   #list { list-style: none; margin: 0; padding: 6px; overflow-y: auto; flex: 1; }
   #list li button { width: 100%; display: flex; align-items: center; gap: 10px; text-align: left;
     background: transparent; border: 1px solid transparent; padding: 8px 8px; font-size: 14px; }
@@ -50,6 +64,7 @@
   #info .hint { color: var(--muted); line-height: 1.45; }
   footer { padding: 8px 16px 12px; font-size: 11px; color: var(--muted); border-top: 1px solid var(--panel-edge); line-height: 1.4; }
   .filebtn input { display: none; }
+  #close-tour[hidden] { display: none; }
   #toggle-panel { display: none; }
 
   #status { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 3;
@@ -74,7 +89,7 @@
 
   @media (max-width: 720px) {
     #panel { top: auto; left: 8px; right: 8px; bottom: 8px; width: auto; max-height: 48vh; }
-    #panel.collapsed #list, #panel.collapsed .row, #panel.collapsed footer { display: none; }
+    #panel.collapsed #list, #panel.collapsed .row, #panel.collapsed #search, #panel.collapsed footer { display: none; }
     #toggle-panel { display: inline-block; float: right; margin-top: -2px; }
     .cesium-viewer-bottom { left: 8px !important; bottom: calc(48vh + 12px) !important; }
     #viewctl { top: 8px; right: 8px; left: 8px; width: auto; }
@@ -96,10 +111,19 @@
     <label class="filebtn" title="Open a different Google Earth file">📂 Open KMZ…
       <input id="file" type="file" accept=".kmz,.kml">
     </label>
+    <button id="close-tour" title="Close this Google Earth file" hidden>✖ Close KMZ</button>
+  </div>
+  <div id="search">
+    <form id="search-form" role="search" autocomplete="off">
+      <input id="search-box" type="search" placeholder="Search for a place…" aria-label="Search for a place"
+        aria-autocomplete="list" aria-controls="suggest">
+      <button type="submit" title="Fly there">Go</button>
+    </form>
+    <ul id="suggest" role="listbox" hidden></ul>
   </div>
   <ol id="list" aria-label="Places in this tour"></ol>
   <div id="info"><div class="hint">Use <b>Open KMZ…</b> to load a .kmz or .kml file saved from Google Earth.</div></div>
-  <footer>Imagery &amp; elevation: Esri, Maxar, Earthstar Geographics. Globe: CesiumJS.</footer>
+  <footer>Imagery, elevation &amp; place search: Esri, Maxar, Earthstar Geographics. Globe: CesiumJS.</footer>
 </aside>
 
 <div id="viewctl" aria-label="Viewing angle">
@@ -175,7 +199,7 @@
       const ds = await Cesium.KmlDataSource.load(data, {
         camera: viewer.scene.camera, canvas: viewer.scene.canvas, clampToGround: true
       });
-      if (tourSource) viewer.dataSources.remove(tourSource, true);
+      clearTour();
       tourSource = ds;
       await viewer.dataSources.add(ds);
 
@@ -219,6 +243,7 @@
       document.title = 'Earth Explorer · ' + title;
       buildList();
       setInfo(null);
+      document.getElementById('close-tour').hidden = false;
       show('');
       prefetchHeights();
     } catch (err) {
@@ -226,6 +251,24 @@
       show('That file could not be opened. Make sure it is a .kmz or .kml from Google Earth.');
       setTimeout(() => show(''), 4000);
     }
+  }
+
+  // Remove the current tour's flags, list and info.
+  function clearTour() {
+    cancelFlight();
+    viewer.selectedEntity = undefined;
+    if (tourSource) viewer.dataSources.remove(tourSource, true);
+    tourSource = null;
+    pins = [];
+    heightCache.clear(); groundHeight.clear(); groundOf.clear();
+  }
+  function closeTour() {
+    clearTour();
+    document.getElementById('tour-title').textContent = 'No tour loaded';
+    document.title = 'Earth Explorer';
+    document.getElementById('close-tour').hidden = true;
+    buildList();
+    setInfo(null);
   }
 
   function buildList() {
@@ -269,22 +312,63 @@
     return la && la.headingPitchRange ? la.headingPitchRange : null;
   }
 
+  // Flying to a place happens in two steps, like Google Earth:
+  //   1. fly looking straight down until you are right above the place, so you can see where you're going;
+  //   2. only then tilt (orbiting around the place) to the angle saved in the KMZ.
+  // With no saved angle (or a saved tilt of 0) the view stays straight down.
+  let flightId = 0, tiltAnim = null;
+  function cancelFlight() {
+    flightId++;
+    viewer.camera.cancelFlight();
+    if (tiltAnim) { viewer.scene.preRender.removeEventListener(tiltAnim); tiltAnim = null; }
+  }
+  // Grabbing the globe stops any flight in progress.
+  for (const ev of ['pointerdown', 'wheel', 'touchstart']) {
+    viewer.scene.canvas.addEventListener(ev, cancelFlight, { passive: true });
+  }
+
+  function flyToSpot(lon, lat, height, opts = {}) {
+    cancelFlight();
+    const id = flightId;
+    const range = opts.range || 57500;
+    const heading = opts.heading || 0;
+    const tilt = Cesium.Math.clamp(opts.tilt || 0, 0, 80);   // radians from straight down
+    const center = Cesium.Cartesian3.fromRadians(lon, lat, height);
+    // Step 1: straight down, directly above the place, at the final viewing distance.
+    viewer.camera.flyTo({
+      destination: Cesium.Cartesian3.fromRadians(lon, lat, height + range),
+      orientation: { heading, pitch: -Cesium.Math.PI_OVER_TWO, roll: 0 },
+      duration: opts.duration ?? 3,
+      complete: () => {
+        if (id !== flightId || tilt < Cesium.Math.toRadians(1)) return;
+        // Step 2: tilt down toward the horizon while circling around the place.
+        const start = performance.now(), ms = 1600;
+        tiltAnim = () => {
+          const t = Math.min((performance.now() - start) / ms, 1);
+          const k = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;   // ease in-out
+          viewer.camera.lookAt(center, new Cesium.HeadingPitchRange(heading, k * tilt - Cesium.Math.PI_OVER_TWO, range));
+          viewer.camera.lookAtTransform(Cesium.Matrix4.IDENTITY);
+          if (t >= 1) cancelFlight();
+        };
+        viewer.scene.preRender.addEventListener(tiltAnim);
+      }
+    });
+  }
+
   async function flyTo(e) {
     const c = cartoOf(e);
     const hpr = lookAtOf(e);
     const range = Math.max(hpr ? hpr.range : 50000, 600) * 1.15;
     const heading = hpr ? hpr.heading : 0;
+    const tilt = hpr ? hpr.pitch + Cesium.Math.PI_OVER_TWO : 0;   // KML stores tilt as pitch = tilt - 90°
     const h = await Promise.race([terrainHeight(e), new Promise(r => setTimeout(() => r(0), 1500))]);
-    const center = Cesium.Cartesian3.fromRadians(c.longitude, c.latitude, h || 0);
-    viewer.camera.flyToBoundingSphere(new Cesium.BoundingSphere(center, 1), {
-      offset: new Cesium.HeadingPitchRange(heading, Cesium.Math.toRadians(DEFAULT_TILT - 90), range),
-      duration: 3
-    });
+    if (viewer.selectedEntity !== e) return;
+    flyToSpot(c.longitude, c.latitude, h || 0, { range, heading, tilt });
   }
 
   // ---------- Viewing angle (tilt / rotate / reset) ----------
   // Tilt is measured from straight down: 0° = looking straight down, 75° = looking toward the horizon.
-  const DEFAULT_TILT = 50;        // the angle used when flying to a place
+  const DEFAULT_TILT = 50;        // the angle "Reset view" uses up close
   const FAR_AWAY = 2500000;       // farther than this (m), "reset" means straight down at the whole globe
   const tiltEl = document.getElementById('tilt'), headEl = document.getElementById('heading');
   const tiltVal = document.getElementById('tilt-val'), headVal = document.getElementById('heading-val');
@@ -405,6 +489,7 @@
 
   document.getElementById('home').addEventListener('click', () => {
     viewer.selectedEntity = undefined;
+    cancelFlight();
     viewer.camera.flyTo({ destination: WHOLE_EARTH, duration: 2.5 });
   });
 
@@ -413,6 +498,133 @@
     if (f) loadTour(f);
     ev.target.value = '';
   });
+
+  document.getElementById('close-tour').addEventListener('click', closeTour);
+
+  // ---------- Place search (Esri World Geocoder) ----------
+  // Searched places always arrive looking straight down, north up.
+  const GEOCODE = 'https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer';
+  const searchForm = document.getElementById('search-form');
+  const searchBox = document.getElementById('search-box');
+  const suggestEl = document.getElementById('suggest');
+  let suggestions = [], suggestOn = -1, suggestTimer = null, suggestSeq = 0, searchMarker = null;
+
+  function closeSuggest() { suggestEl.hidden = true; suggestOn = -1; }
+  function renderSuggest(msg) {
+    suggestEl.innerHTML = '';
+    if (msg) {
+      const li = document.createElement('li'); li.className = 'msg'; li.textContent = msg;
+      suggestEl.appendChild(li);
+    }
+    suggestions.forEach((sg, i) => {
+      const li = document.createElement('li');
+      li.setAttribute('role', 'option');
+      li.textContent = sg.text;
+      li.classList.toggle('on', i === suggestOn);
+      li.addEventListener('mousedown', (ev) => { ev.preventDefault(); runSearch(sg); });
+      suggestEl.appendChild(li);
+    });
+    suggestEl.hidden = !msg && !suggestions.length;
+  }
+
+  searchBox.addEventListener('input', () => {
+    clearTimeout(suggestTimer);
+    const text = searchBox.value.trim();
+    if (text.length < 2) { suggestions = []; closeSuggest(); return; }
+    suggestTimer = setTimeout(async () => {
+      const seq = ++suggestSeq;
+      try {
+        const r = await fetch(GEOCODE + '/suggest?f=json&maxSuggestions=6&text=' + encodeURIComponent(text));
+        const j = await r.json();
+        if (seq !== suggestSeq) return;
+        suggestions = (j.suggestions || []).filter(sg => !sg.isCollection);
+        suggestOn = -1;
+        renderSuggest();
+      } catch { /* suggestions are optional; pressing Go still searches */ }
+    }, 250);
+  });
+  searchBox.addEventListener('keydown', (ev) => {
+    if (suggestEl.hidden || !suggestions.length) { if (ev.key === 'Escape') closeSuggest(); return; }
+    if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp') {
+      ev.preventDefault();
+      const n = suggestions.length;
+      suggestOn = ev.key === 'ArrowDown' ? (suggestOn + 1) % n : (suggestOn - 1 + n) % n;
+      renderSuggest();
+    } else if (ev.key === 'Escape') closeSuggest();
+  });
+  searchBox.addEventListener('blur', () => setTimeout(closeSuggest, 150));
+  searchForm.addEventListener('submit', (ev) => {
+    ev.preventDefault();
+    const text = searchBox.value.trim();
+    if (!text) return;
+    runSearch(suggestOn >= 0 && !suggestEl.hidden ? suggestions[suggestOn] : { text });
+  });
+
+  async function runSearch(sg) {
+    clearTimeout(suggestTimer); suggestSeq++;
+    searchBox.value = sg.text;
+    closeSuggest();
+    let place;
+    try {
+      const url = GEOCODE + '/findAddressCandidates?f=json&maxLocations=1&outFields=Type,PlaceName' +
+        '&SingleLine=' + encodeURIComponent(sg.text) + (sg.magicKey ? '&magicKey=' + encodeURIComponent(sg.magicKey) : '');
+      const j = await (await fetch(url)).json();
+      place = j.candidates && j.candidates[0];
+    } catch (err) {
+      console.error(err);
+      suggestions = []; renderSuggest('Search is not available. The web filter may be blocking geocode.arcgis.com.');
+      return;
+    }
+    if (!place) { suggestions = []; renderSuggest('No places found for "' + sg.text + '".'); return; }
+    goToPlace(place);
+  }
+
+  async function goToPlace(place) {
+    const lon = place.location.x, lat = place.location.y;
+    const ext = place.extent;
+    // Pick a viewing distance that fits the whole place (a country, a city, a mountain…) on screen.
+    let range = 3000;
+    if (ext) {
+      const midLat = Cesium.Math.toRadians((ext.ymin + ext.ymax) / 2);
+      const w = Math.abs(ext.xmax - ext.xmin) * 111320 * Math.cos(midLat);
+      const h = Math.abs(ext.ymax - ext.ymin) * 110574;
+      range = Cesium.Math.clamp(Math.max(w, h) * 1.3, 1500, 18000000);
+    }
+    viewer.selectedEntity = undefined;
+    const name = place.address || searchBox.value;
+    const c = Cesium.Cartographic.fromDegrees(lon, lat);
+    if (searchMarker) viewer.entities.remove(searchMarker);
+    searchMarker = viewer.entities.add({
+      position: Cesium.Cartesian3.fromDegrees(lon, lat),
+      point: { pixelSize: 11, color: Cesium.Color.fromCssColorString('#ff5a5a'), outlineColor: Cesium.Color.WHITE,
+        outlineWidth: 2, heightReference: Cesium.HeightReference.CLAMP_TO_GROUND, disableDepthTestDistance: Number.POSITIVE_INFINITY },
+      label: { text: name, font: '600 14px system-ui, sans-serif', fillColor: Cesium.Color.WHITE,
+        outlineColor: Cesium.Color.BLACK, outlineWidth: 3, style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+        verticalOrigin: Cesium.VerticalOrigin.BOTTOM, pixelOffset: new Cesium.Cartesian2(0, -12),
+        heightReference: Cesium.HeightReference.CLAMP_TO_GROUND, disableDepthTestDistance: Number.POSITIVE_INFINITY }
+    });
+
+    const info = document.getElementById('info');
+    info.innerHTML = '<h2></h2><div><span class="k">Location:</span> <span class="loc"></span></div>' +
+      '<div><span class="k">Elevation (approx.):</span> <span class="elev">measuring…</span></div>';
+    info.querySelector('h2').textContent = name;
+    info.querySelector('.loc').textContent = fmt(lat, 'N', 'S') + ', ' + fmt(lon, 'E', 'W');
+
+    const measured = hasTerrain
+      ? Cesium.sampleTerrainMostDetailed(terrainProvider, [c.clone()])
+          .then(([s]) => Number.isFinite(s.height) ? s.height : null).catch(() => null)
+      : Promise.resolve(null);
+    // Don't hold up the flight for long waiting on the ground height.
+    const quick = await Promise.race([measured, new Promise(r => setTimeout(() => r(null), 1500))]);
+    flyToSpot(c.longitude, c.latitude, quick || 0, { range });
+    const height = await measured;
+    const elevEl = info.querySelector('.elev');
+    if (!elevEl || info.querySelector('h2').textContent !== name) return;
+    if (height === null) { elevEl.textContent = 'not available'; return; }
+    const m = Math.round(height), ft = Math.round(height * 3.28084);
+    elevEl.textContent = Math.abs(m).toLocaleString() + ' m (' + Math.abs(ft).toLocaleString() + ' ft)' +
+      (m < 0 ? ' below sea level' : ' above sea level');
+  }
 
   const panel = document.getElementById('panel');
   document.getElementById('toggle-panel').addEventListener('click', (ev) => {
