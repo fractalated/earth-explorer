@@ -9,7 +9,6 @@ A 3D globe for Earth Science class that runs in Chrome on school Chromebooks, no
 - Spinning 3D globe with satellite imagery, land elevation **and** ocean-floor depth (trenches and ridges show in 3D)
 - Opens with an empty globe; no tour is built in
 - Shows each place's location and approximate elevation
-- **Plate boundaries** layer (can be turned on or off)
 - **Viewing angle** box: Tilt and Rotate sliders, **North up**, and **Reset view** (north up at the standard 50° angle, or straight down when viewing the whole Earth)
 - **Open KMZ…** button: load any `.kmz` or `.kml` saved from Google Earth. Its places show as numbered flags on poles that stand straight up from the surface, so hills never hide them. Click one in the list or on the globe to fly there
 
@@ -35,4 +34,3 @@ Student Chromebooks need to reach these sites:
 ## Credits
 
 Globe: [CesiumJS](https://cesium.com/platform/cesiumjs/) (Apache 2.0). Imagery and elevation: Esri, Maxar, Earthstar Geographics.
-Plate boundaries: Bird, P. (2003), *An updated digital model of plate boundaries*, G³ 4(3), via [fraxen/tectonicplates](https://github.com/fraxen/tectonicplates) (ODC-BY).
