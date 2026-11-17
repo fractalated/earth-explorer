@@ -327,30 +327,63 @@
     viewer.scene.canvas.addEventListener(ev, cancelFlight, { passive: true });
   }
 
-  function flyToSpot(lon, lat, height, opts = {}) {
+  // Smoothly swing the camera around a spot on the ground from one tilt to another (radians from straight down).
+  function animateTilt(center, heading, range, from, to, ms) {
+    return new Promise((resolve) => {
+      const start = performance.now();
+      tiltAnim = () => {
+        const t = Math.min((performance.now() - start) / ms, 1);
+        const k = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;   // ease in-out
+        viewer.camera.lookAt(center, new Cesium.HeadingPitchRange(heading, from + k * (to - from) - Cesium.Math.PI_OVER_TWO, range));
+        viewer.camera.lookAtTransform(Cesium.Matrix4.IDENTITY);
+        if (t >= 1) {
+          viewer.scene.preRender.removeEventListener(tiltAnim); tiltAnim = null;
+          resolve();
+        }
+      };
+      viewer.scene.preRender.addEventListener(tiltAnim);
+    });
+  }
+
+  // Tilt of the current view (radians from straight down) around the spot at the middle of the screen.
+  function currentTilt(target) {
+    const up = Cesium.Ellipsoid.WGS84.geodeticSurfaceNormal(target, new Cesium.Cartesian3());
+    const toCam = Cesium.Cartesian3.normalize(
+      Cesium.Cartesian3.subtract(viewer.camera.positionWC, target, new Cesium.Cartesian3()), new Cesium.Cartesian3());
+    return Math.acos(Cesium.Math.clamp(Cesium.Cartesian3.dot(up, toCam), -1, 1));
+  }
+
+  // Step 0 (leaving a place): if the view is tilted, swing back to straight down first,
+  // so the whole trip is seen from above.
+  function levelOut() {
+    const target = screenCenterOnGround();
+    if (!target) return Promise.resolve();
+    const tilt = currentTilt(target);
+    if (tilt < Cesium.Math.toRadians(1)) return Promise.resolve();
+    const range = Cesium.Cartesian3.distance(viewer.camera.positionWC, target);
+    const ms = 450 + Cesium.Math.toDegrees(tilt) * 22;   // about 1.8 s from a 60° tilt
+    return animateTilt(target, viewer.camera.heading, range, tilt, 0, ms);
+  }
+
+  // `height` may be a number or a promise of one (the ground height is looked up while leveling out).
+  async function flyToSpot(lon, lat, height, opts = {}) {
     cancelFlight();
     const id = flightId;
     const range = opts.range || 57500;
     const heading = opts.heading || 0;
     const tilt = Cesium.Math.clamp(opts.tilt || 0, 0, 80);   // radians from straight down
-    const center = Cesium.Cartesian3.fromRadians(lon, lat, height);
+    const [h] = await Promise.all([Promise.resolve(height), levelOut()]);
+    if (id !== flightId) return;
+    const center = Cesium.Cartesian3.fromRadians(lon, lat, h || 0);
     // Step 1: straight down, directly above the place, at the final viewing distance.
     viewer.camera.flyTo({
-      destination: Cesium.Cartesian3.fromRadians(lon, lat, height + range),
+      destination: Cesium.Cartesian3.fromRadians(lon, lat, (h || 0) + range),
       orientation: { heading, pitch: -Cesium.Math.PI_OVER_TWO, roll: 0 },
-      duration: opts.duration ?? 3,
-      complete: () => {
+      duration: opts.duration ?? 6,
+      complete: async () => {
         if (id !== flightId || tilt < Cesium.Math.toRadians(1)) return;
         // Step 2: tilt down toward the horizon while circling around the place.
-        const start = performance.now(), ms = 1600;
-        tiltAnim = () => {
-          const t = Math.min((performance.now() - start) / ms, 1);
-          const k = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;   // ease in-out
-          viewer.camera.lookAt(center, new Cesium.HeadingPitchRange(heading, k * tilt - Cesium.Math.PI_OVER_TWO, range));
-          viewer.camera.lookAtTransform(Cesium.Matrix4.IDENTITY);
-          if (t >= 1) cancelFlight();
-        };
-        viewer.scene.preRender.addEventListener(tiltAnim);
+        await animateTilt(center, heading, range, 0, tilt, 2400);
       }
     });
   }
@@ -361,9 +394,8 @@
     const range = Math.max(hpr ? hpr.range : 50000, 600) * 1.15;
     const heading = hpr ? hpr.heading : 0;
     const tilt = hpr ? hpr.pitch + Cesium.Math.PI_OVER_TWO : 0;   // KML stores tilt as pitch = tilt - 90°
-    const h = await Promise.race([terrainHeight(e), new Promise(r => setTimeout(() => r(0), 1500))]);
-    if (viewer.selectedEntity !== e) return;
-    flyToSpot(c.longitude, c.latitude, h || 0, { range, heading, tilt });
+    const h = Promise.race([terrainHeight(e), new Promise(r => setTimeout(() => r(0), 1500))]);
+    flyToSpot(c.longitude, c.latitude, h, { range, heading, tilt });
   }
 
   // ---------- Viewing angle (tilt / rotate / reset) ----------
@@ -489,8 +521,7 @@
 
   document.getElementById('home').addEventListener('click', () => {
     viewer.selectedEntity = undefined;
-    cancelFlight();
-    viewer.camera.flyTo({ destination: WHOLE_EARTH, duration: 2.5 });
+    flyToSpot(Cesium.Math.toRadians(-110), Cesium.Math.toRadians(25), 0, { range: 20000000, duration: 5 });
   });
 
   document.getElementById('file').addEventListener('change', (ev) => {
@@ -615,8 +646,8 @@
           .then(([s]) => Number.isFinite(s.height) ? s.height : null).catch(() => null)
       : Promise.resolve(null);
     // Don't hold up the flight for long waiting on the ground height.
-    const quick = await Promise.race([measured, new Promise(r => setTimeout(() => r(null), 1500))]);
-    flyToSpot(c.longitude, c.latitude, quick || 0, { range });
+    const quick = Promise.race([measured, new Promise(r => setTimeout(() => r(null), 1500))]);
+    flyToSpot(c.longitude, c.latitude, quick, { range });
     const height = await measured;
     const elevEl = info.querySelector('.elev');
     if (!elevEl || info.querySelector('h2').textContent !== name) return;
