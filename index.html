@@ -158,13 +158,28 @@
   catch (err) { console.warn('3D terrain unavailable; using a smooth globe.', err); terrainProvider = new Cesium.EllipsoidTerrainProvider(); }
   const hasTerrain = !(terrainProvider instanceof Cesium.EllipsoidTerrainProvider);
 
+  // Some older GPUs (e.g. Intel HD 4000 on Linux Chrome) crash compiling shaders when
+  // multisample anti-aliasing is on. Try full quality first; fall back to safe mode once.
+  const SAFE_KEY = 'earthExplorerSafeGraphics';
+  let safeGraphics = new URLSearchParams(location.search).has('safegl');
+  try { safeGraphics = safeGraphics || localStorage.getItem(SAFE_KEY) === '1'; } catch (e) {}
   const viewer = new Cesium.Viewer('globe', {
     baseLayer: Cesium.ImageryLayer.fromProviderAsync(Cesium.ArcGisMapServerImageryProvider.fromUrl(IMAGERY)),
     terrainProvider,
     baseLayerPicker: false, geocoder: false, homeButton: false, sceneModePicker: false,
     navigationHelpButton: false, animation: false, timeline: false, fullscreenButton: false,
-    infoBox: false, selectionIndicator: false
+    infoBox: false, selectionIndicator: false,
+    msaaSamples: safeGraphics ? 1 : 4,
+    showRenderLoopErrors: safeGraphics
   });
+  if (!safeGraphics) {
+    viewer.scene.renderError.addEventListener(() => {
+      try { localStorage.setItem(SAFE_KEY, '1'); } catch (e) {}
+      const url = new URL(location.href);
+      url.searchParams.set('safegl', '1');
+      location.replace(url);
+    });
+  }
   viewer.imageryLayers.addImageryProvider(await Cesium.ArcGisMapServerImageryProvider.fromUrl(LABELS));
   viewer.scene.globe.depthTestAgainstTerrain = true;
   viewer.scene.screenSpaceCameraController.enableCollisionDetection = true;
